@@ -4,7 +4,7 @@
  * is done in quotaManager.buildAccountCards() on the extension host side.
  */
 
-import { dotClass, fillClass, timeLeft, shortModelName, shortTierName, fmtNum } from '../../shared/helpers';
+import { dotClass, fillClass, timeLeft, shortTierName } from '../../shared/helpers';
 
 // SVG icon constants for tracked account action buttons
 const SWITCH_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3 4 7l4 4"/><path d="M4 7h16"/><path d="M16 21l4-4-4-4"/><path d="M20 17H4"/></svg>';
@@ -82,44 +82,24 @@ export function renderAll(cards: any[], pinnedModels: Record<string, string>): v
             : '';
         const tierBadge = a.tierName ? '<span class="tier-tag">' + shortTierName(a.tierName) + '</span>' : '';
 
-        // Credits as pill badges
-        let creditsLine = '';
-        if (a.aiCredits != null || a.promptCredits != null || a.flowCredits != null) {
-            let chips = '';
-            if (a.aiCredits != null) chips += '<span class="cr-chip"><span class="cr-icon">CR</span>' + fmtNum(a.aiCredits) + '</span>';
-            if (a.promptCredits != null) {
-                const pmx = a.promptCreditsMax ? '/' + fmtNum(a.promptCreditsMax) : '';
-                chips += '<span class="cr-chip cr-prompt">P ' + fmtNum(a.promptCredits) + pmx + '</span>';
-            }
-            if (a.flowCredits != null) {
-                const fmx = a.flowCreditsMax ? '/' + fmtNum(a.flowCreditsMax) : '';
-                chips += '<span class="cr-chip cr-flow">F ' + fmtNum(a.flowCredits) + fmx + '</span>';
-            }
-            creditsLine = '<div class="acct-credits">' + chips + '</div>';
-        }
 
-        // Pinned or bottleneck for collapsed view
+        // Collapsed view: one line per merged family (Gemini, Claude). No pin/favorite logic.
         let subBlock = '';
         if (a.isError) {
             subBlock = '<div class="acct-sub"><span style="color:var(--error)">\u26a0 ' + (a.errorMessage || 'Error') + '</span></div>';
-        } else {
-            const pinnedLabel = pinnedModels[a.email];
-            const displayModel = pinnedLabel
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                ? (a.models.find((m: any) => m.label === pinnedLabel) || a.bottleneck)
-                : a.bottleneck;
-            if (displayModel) {
-                const bnLabel = displayModel.label || shortModelName(displayModel.id);
-                const pctCls = fillClass(displayModel.pct);
-                const tl = timeLeft(displayModel.resetTime);
-                subBlock = '<div class="acct-sub">'
-                    + '<span class="bn-model">' + bnLabel + '</span> \u00b7 '
-                    + '<span class="bn-pct ' + pctCls + '">' + displayModel.pct + '%</span>'
+        } else if (a.models && a.models.length > 0) {
+            let lines = '';
+            for (const m of a.models as any[]) {
+                const pctCls = fillClass(m.pct);
+                const tl = timeLeft(m.resetTime);
+                lines += '<span class="bn-model">' + m.label + '</span> \u00b7 '
+                    + '<span class="bn-pct ' + pctCls + '">' + m.pct + '%</span>'
                     + (tl ? ' <span class="bn-sep">\u00b7</span> ' + tl : '')
-                    + '</div>';
-            } else {
-                subBlock = '<div class="acct-sub">No model data</div>';
+                    + '<br>';
             }
+            subBlock = '<div class="acct-sub">' + lines + '</div>';
+        } else {
+            subBlock = '<div class="acct-sub">No model data</div>';
         }
 
         const activeCls = a.isActive ? ' acct-active' : '';
@@ -127,9 +107,9 @@ export function renderAll(cards: any[], pinnedModels: Record<string, string>): v
         html += '<div class="acct-hdr" data-action="toggle-open">';
         html += '<div class="acct-dot ' + dotCls + '"></div>';
         html += '<div class="acct-info">';
-        html += '<div class="acct-email">' + a.email + ' ' + activeBadge + ' ' + tierBadge + transitionBadge + '</div>';
+        const displayEmail = a.email.split('@')[0];
+        html += '<div class="acct-email">' + displayEmail + ' ' + activeBadge + ' ' + tierBadge + transitionBadge + '</div>';
         html += subBlock;
-        html += creditsLine;
         html += '</div>';
         html += actionBtns;
         html += '<span class="acct-chev">\u203a</span>';

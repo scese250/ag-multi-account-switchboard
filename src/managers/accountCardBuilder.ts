@@ -5,7 +5,7 @@
 
 import { AccountQuota, AccountCard, ModelCard, LocalQuotaData } from '../types';
 import { shortModelName, normalizeModelKey } from '../shared/helpers';
-import { parseUserTier, parsePlanStatus } from '../utils/lsTypes';
+import { parseUserTier } from '../utils/lsTypes';
 
 /**
  * Build a normKey → LS label lookup map from local protobuf data.
@@ -53,6 +53,45 @@ function resolveLabel(apiKey: string, labelMap: Map<string, string>): string {
     return shortModelName(apiKey);
 }
 
+/**
+ * Classify a model label into a display family.
+ * Returns 'gemini' | 'claude' | null (null = exclude).
+ */
+function modelFamily(label: string): 'gemini' | 'claude' | null {
+    const l = label.toLowerCase();
+    if (l.startsWith('gemini')) return 'gemini';
+    if (l.startsWith('claude')) return 'claude';
+    return null; // GPT-OSS and anything else → exclude
+}
+
+/**
+ * Merge a raw model list into at most two entries: "Gemini" and "Claude".
+ * Within each family, takes the minimum pct (worst quota) and earliest resetTime.
+ * GPT-OSS and unrecognised models are dropped.
+ */
+function mergeModelGroups(models: ModelCard[]): ModelCard[] {
+    const groups: Record<string, ModelCard> = {};
+    for (const m of models) {
+        const fam = modelFamily(m.label);
+        if (!fam) continue;
+        const displayLabel = fam === 'gemini' ? 'Gemini' : 'Claude';
+        const existing = groups[fam];
+        if (!existing) {
+            groups[fam] = { ...m, label: displayLabel };
+        } else {
+            // ponytail: keep worst pct, earliest reset
+            if (m.pct < existing.pct) {
+                groups[fam] = { ...m, label: displayLabel };
+            }
+        }
+    }
+    // Stable order: Gemini first, Claude second
+    const result: ModelCard[] = [];
+    if (groups['gemini']) result.push(groups['gemini']);
+    if (groups['claude']) result.push(groups['claude']);
+    return result;
+}
+
 export function buildAccountCards(
     localData: LocalQuotaData | null,
     trackedQuotas: AccountQuota[],
@@ -74,7 +113,7 @@ export function buildAccountCards(
             .filter((m: any) => m.quotaInfo)
             .sort((a: any, b: any) => (a.label || '').localeCompare(b.label || ''));
 
-        const models: ModelCard[] = rawModels.map((m: any) => ({
+        const rawMapped: ModelCard[] = rawModels.map((m: any) => ({
             id: m.modelOrAlias?.model || m.label,
             label: m.label || shortModelName(m.modelOrAlias?.model),
             pct: m.quotaInfo.remainingFraction !== undefined
@@ -83,11 +122,9 @@ export function buildAccountCards(
             resetTime: m.quotaInfo.resetTime || '',
             isLocal: true,
         }));
+        const models = mergeModelGroups(rawMapped);
 
-        const bottleneckModel = models.length > 0 ? models.reduce((a, b) => a.pct < b.pct ? a : b) : null;
         const userTier = parseUserTier(status.userTier);
-        const planStatus = parsePlanStatus(status.planStatus);
-        const aiCredits = userTier.availableCredits.find(c => c.creditType === 'GOOGLE_ONE_AI');
 
         // Intent email ≠ LS email → switch in progress, LS hasn't adopted new identity yet
         const isTransitioning = !!(
@@ -96,21 +133,22 @@ export function buildAccountCards(
             switchActive
         );
 
+        const bottleneckMerged = models.length > 0 ? models.reduce((a, b) => a.pct < b.pct ? a : b) : null;
         cards.push({
             email: status.email || 'active-local',
             isActive: !activeEmail || activeEmail === localEmail,
             isTransitioning,
             pendingEmail: isTransitioning ? activeEmailRaw : undefined,
             models,
-            bottleneck: bottleneckModel,
+            bottleneck: bottleneckMerged,
             tierName: userTier.name,
             tierId: userTier.id,
-            aiCredits: aiCredits ? parseInt(aiCredits.creditAmount, 10) : null,
-            promptCredits: planStatus.availablePromptCredits,
-            promptCreditsMax: planStatus.planInfo.monthlyPromptCredits,
-            flowCredits: planStatus.availableFlowCredits,
-            flowCreditsMax: planStatus.planInfo.monthlyFlowCredits,
-            resetTime: bottleneckModel?.resetTime || models[0]?.resetTime || '',
+            aiCredits: null,
+            promptCredits: null,
+            promptCreditsMax: null,
+            flowCredits: null,
+            flowCreditsMax: null,
+            resetTime: bottleneckMerged?.resetTime || models[0]?.resetTime || '',
             isError: false,
             selectedModels,
             isLocal: true,
@@ -125,15 +163,16 @@ export function buildAccountCards(
         const trackedEmail = (trackedQuota.account.email || '').toLowerCase();
         if (dedupEmail && trackedEmail === dedupEmail) continue;
 
-        const models: ModelCard[] = (trackedQuota.models || []).map(m => ({
+        const rawTracked: ModelCard[] = (trackedQuota.models || []).map(m => ({
             id: m.name,
             label: resolveLabel(m.name, labelMap),
             pct: m.percentage || 0,
             resetTime: m.resetTimeRaw || m.resetTime || '',
             isLocal: false,
         }));
+        const models = mergeModelGroups(rawTracked);
 
-        const bottleneckModel = models.length > 0 ? models.reduce((a, b) => a.pct < b.pct ? a : b) : null;
+        const bottleneckModel = models.length > 0 ? models.reduce((a, b) => a.pct < b.pct ? a : b) : null;  // ponytail: bottleneck of merged groups
 
         cards.push({
             email: trackedQuota.account.email || 'Unknown',
@@ -156,6 +195,15 @@ export function buildAccountCards(
         });
     }
 
-    cards.sort((a, b) => (a.isActive ? 0 : 1) - (b.isActive ? 0 : 1));
+    // ponytail: sort priority — active first, then by token availability tier
+    function sortTier(card: AccountCard): number {
+        if (card.isActive) return 0;
+        if (card.isError || card.models.length === 0) return 4;
+        const available = card.models.filter(m => m.pct > 0).length;
+        if (available === card.models.length) return 1; // all models have quota
+        if (available > 0)                    return 2; // at least one model has quota
+        return 3;                                       // all drained
+    }
+    cards.sort((a, b) => sortTier(a) - sortTier(b));
     return cards;
 }
