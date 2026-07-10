@@ -156,12 +156,15 @@ export function buildAccountCards(
     }
 
     // Dedup: skip tracked account if its email matches local card (local has richer data).
-    // During switch A→B: local=A(stale), tracked A must still be deduped.
-    const dedupEmail = localEmail || '';
+    // During switch A→B: local=A(stale), activeEmail=B(intent).
+    // Dedup both: suppress tracked A (matches local) AND tracked B (matches intent).
+    const dedupEmails = new Set<string>();
+    if (localEmail) dedupEmails.add(localEmail);
+    if (activeEmail && activeEmail !== localEmail) dedupEmails.add(activeEmail);
 
     for (const trackedQuota of trackedQuotas) {
         const trackedEmail = (trackedQuota.account.email || '').toLowerCase();
-        if (dedupEmail && trackedEmail === dedupEmail) continue;
+        if (dedupEmails.has(trackedEmail)) continue;
 
         const rawTracked: ModelCard[] = (trackedQuota.models || []).map(m => ({
             id: m.name,

@@ -66,7 +66,7 @@ export class QuotaManager {
         private readonly context: vscode.ExtensionContext,
         private readonly accountManager: AccountManager,
     ) {
-        this.switchService = new AccountSwitchService(context, accountManager.getAuthService());
+        this.switchService = new AccountSwitchService(context, accountManager.getAuthService(), () => this.serverDiscovery.discover());
         this.statusBar = new StatusBarService(context);
         context.subscriptions.push({ dispose: () => this.switchService.dispose() });
         context.subscriptions.push({ dispose: () => this.liveStream.destroy() });
@@ -549,6 +549,8 @@ export class QuotaManager {
         this.switchController?.abort();
         this.switchController = new AbortController();
 
+        this.lastActiveEmail = account.email;
+
         try {
             const result = await this.switchService.switchAccount({
                 email: account.email, name: account.name, accessToken: tokens.access_token,
@@ -560,6 +562,7 @@ export class QuotaManager {
 
                 try {
                     this.cachedServer = null;
+                    await new Promise(r => setTimeout(r, 500));
                     const serverInfo = await this.resolveServer();
                     if (!serverInfo) throw new Error('no server');
                     const localData = await this.serverDiscovery.fetchLocalQuota(serverInfo).catch(() => null);
@@ -581,6 +584,8 @@ export class QuotaManager {
             }
         } finally {
             this.switchController = null;
+            this.cachedServer = null;
+            this.refresh(account.email);
         }
     }
 

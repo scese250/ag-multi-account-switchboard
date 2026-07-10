@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { GoogleAuthService } from './googleAuth';
-import { SwitchAccountOptions, USSApi } from '../types';
+import { SwitchAccountOptions, USSApi, ServerInfo } from '../types';
 import { getUSS } from '../utils/uss';
 import {
     encodeString, encodeVarintField,
@@ -8,7 +8,7 @@ import {
 } from '../shared/protobuf';
 import { createLogger } from '../utils/logger';
 import { dbExec } from '../shared/db';
-import { findLSEndpoints, loadLSCert, callLSEndpoint, LsEndpoint } from '../utils/lsClient';
+import { callLsProto } from '../utils/lsClient';
 import { LS_SERVICE_PATH, RENEWAL_RETRY_DELAY_MS } from '../constants';
 
 const log = createLogger('AccountSwitch');
@@ -72,7 +72,11 @@ export class AccountSwitchService {
     private static readonly POLL_INTERVAL_MS = 800;
     private static readonly POLL_INITIAL_DELAY_MS = 300;
 
-    constructor(_context: vscode.ExtensionContext, authService: GoogleAuthService) {
+    constructor(
+        _context: vscode.ExtensionContext,
+        authService: GoogleAuthService,
+        private readonly serverResolver: () => Promise<ServerInfo | null>,
+    ) {
         this.authService = authService;
     }
 
@@ -132,17 +136,17 @@ export class AccountSwitchService {
             }
 
             // 5. Readiness Gate — wait for LS to confirm its USS IPC reconnect.
-            //    Returns discovered endpoints so downstream functions don't need
+            //    Returns discovered server so downstream functions don't need
             //    to re-discover (Gate-Once-Pass-Down pattern).
             //    handleAuthRefresh can temporarily kill LS — the gate retries
-            //    endpoint discovery inside its loop until LS comes back.
-            const { ready, endpoints } = await this.awaitLSReadiness();
+            //    server discovery inside its loop until LS comes back.
+            const { ready, server } = await this.awaitLSReadiness();
 
-            // 6. registerGdmUser — uses gate-provided endpoints (no independent discovery)
-            await this.callRegisterGdmUser(endpoints);
+            // 6. registerGdmUser — uses gate-provided server (no independent discovery)
+            await this.callRegisterGdmUser(server);
 
             // 7. Await email confirmation from LS
-            const result = await this.pollRichUserStatus(uss, generation, email, endpoints);
+            const result = await this.pollRichUserStatus(uss, generation, email, server);
             if (!result.confirmed) {
                 log.warn('Email confirmation timed out — LS may not have adopted the new email yet');
             }
@@ -223,7 +227,7 @@ export class AccountSwitchService {
                 });
             }
 
-            await this.callRegisterGdmUser(await findLSEndpoints());
+            await this.callRegisterGdmUser(await this.serverResolver());
 
             log.info(`✅ Token renewed for ${this.activeEmail}, next in ~${Math.round((refreshed.expires_in || 3600) / 60) - 10}m`);
 
@@ -249,32 +253,29 @@ export class AccountSwitchService {
      * proves the IPC channel is live. This is the Kubernetes Readiness Probe
      * pattern — don't send traffic until the target is ready.
      *
-     * Gate-Once-Pass-Down: returns discovered endpoints so downstream functions
+     * Gate-Once-Pass-Down: returns discovered server so downstream functions
      * (registerGdmUser, pollRichUserStatus) don't need independent discovery.
-     * Endpoint discovery is INSIDE the retry loop — handles LS temporarily
+     * Server discovery is INSIDE the retry loop — handles LS temporarily
      * going down after handleAuthRefresh.
      */
     private async awaitLSReadiness(
         maxWaitMs = AccountSwitchService.LS_READY_MAX_WAIT_MS,
         intervalMs = AccountSwitchService.LS_READY_POLL_INTERVAL_MS,
-    ): Promise<{ ready: boolean; endpoints: LsEndpoint[] }> {
-        const ca = loadLSCert();
+    ): Promise<{ ready: boolean; server: ServerInfo | null }> {
         const start = Date.now();
 
         while (Date.now() - start < maxWaitMs) {
-            const endpoints = await findLSEndpoints();
-            if (endpoints.length === 0) {
-                log.info(`LS readiness gate: no endpoints yet (${Date.now() - start}ms), retrying...`);
+            const server = await this.serverResolver();
+            if (!server) {
+                log.info(`LS readiness gate: no server yet (${Date.now() - start}ms), retrying...`);
                 await delay(intervalMs);
                 continue;
             }
-            const ls = endpoints[0];
 
             try {
-                const body = await callLSEndpoint(
-                    ls,
+                const body = await callLsProto(
+                    server,
                     `${LS_SERVICE_PATH}/GetUserStatus`,
-                    ca,
                 );
                 const userStatus = body ? extractField(body, 1) : null;
                 if (!userStatus || userStatus.length <= 5) { await delay(intervalMs); continue; }
@@ -282,37 +283,36 @@ export class AccountSwitchService {
                 const email = extractStringField(userStatus, 7);
                 if (!email) { await delay(intervalMs); continue; }
 
-                log.info(`LS readiness gate: READY (email=${email}, ${Date.now() - start}ms, ${endpoints.length} LS)`);
-                return { ready: true, endpoints };
+                log.info(`LS readiness gate: READY (email=${email}, ${Date.now() - start}ms)`);
+                return { ready: true, server };
             } catch (e: any) {
                 log.info(`LS readiness gate: probe failed (${e?.message}), waiting...`);
             }
             await delay(intervalMs);
         }
         log.warn(`LS readiness gate: TIMEOUT after ${maxWaitMs}ms — proceeding best-effort`);
-        return { ready: false, endpoints: [] };
+        const server = await this.serverResolver();
+        return { ready: false, server };
     }
 
     // ==================== LS HTTP Communication ====================
 
     /**
-     * Call RegisterGdmUser on provided LS endpoints.
-     * Endpoints come from awaitLSReadiness (Gate-Once-Pass-Down) —
+     * Call RegisterGdmUser on the discovered LS server.
+     * Server comes from awaitLSReadiness (Gate-Once-Pass-Down) —
      * no independent discovery needed.
      */
-    private async callRegisterGdmUser(lsEndpoints: LsEndpoint[]): Promise<void> {
-        if (lsEndpoints.length === 0) {
-            log.warn('registerGdmUser: no LS endpoints provided (gate returned empty)');
+    private async callRegisterGdmUser(server: ServerInfo | null): Promise<void> {
+        if (!server) {
+            log.warn('registerGdmUser: no server available (gate returned null)');
             return;
         }
-        const ca = loadLSCert();
-        const results = await Promise.allSettled(
-            lsEndpoints.map(ls => callLSEndpoint(ls, `${LS_SERVICE_PATH}/RegisterGdmUser`, ca))
-        );
-        results.forEach((r, i) => {
-            const ls = lsEndpoints[i];
-            log.info(`registerGdmUser on port=${ls.port}: ${r.status === 'fulfilled' ? 'OK' : (r as PromiseRejectedResult).reason}`);
-        });
+        try {
+            await callLsProto(server, `${LS_SERVICE_PATH}/RegisterGdmUser`);
+            log.info(`registerGdmUser on port=${server.port}: OK`);
+        } catch (e: any) {
+            log.warn(`registerGdmUser on port=${server.port}: ${e?.message}`);
+        }
     }
 
     /**
@@ -328,21 +328,19 @@ export class AccountSwitchService {
      * @param targetEmail - Expected email after switch. Used for early exit.
      */
     /**
-     * @param initialEndpoints - Endpoints from awaitLSReadiness gate.
-     *   Falls back to independent discovery if these go stale (CSRF rotation).
+     * @param initialServer - Server from awaitLSReadiness gate.
+     *   Falls back to re-discovery if stale (CSRF rotation).
      */
     private async pollRichUserStatus(
         uss: USSApi,
         generation: number,
         targetEmail: string,
-        initialEndpoints: LsEndpoint[],
+        initialServer: ServerInfo | null,
         maxWaitMs = AccountSwitchService.POLL_MAX_WAIT_MS,
         intervalMs = AccountSwitchService.POLL_INTERVAL_MS,
     ): Promise<{ confirmed: boolean }> {
-        let lsProcesses = initialEndpoints.length > 0 ? initialEndpoints : await findLSEndpoints();
-        if (lsProcesses.length === 0) return { confirmed: false };
-        const ca = loadLSCert();
-        let ls = lsProcesses[0];
+        let server = initialServer ?? await this.serverResolver();
+        if (!server) return { confirmed: false };
 
         let emailMatched = false;
         const targetNorm = targetEmail.toLowerCase();
@@ -359,7 +357,7 @@ export class AccountSwitchService {
 
             pollCount++;
             try {
-                const body = await callLSEndpoint(ls, `${LS_SERVICE_PATH}/GetUserStatus`, ca);
+                const body = await callLsProto(server!, `${LS_SERVICE_PATH}/GetUserStatus`);
                 const userStatus = body ? extractField(body, 1) : null;
 
                 // ── FORENSIC: log every poll iteration ──
@@ -375,21 +373,20 @@ export class AccountSwitchService {
                 log.info(`FORENSIC EMAIL_MATCH @${elapsed}ms: statusLen=${userStatus.length}B — THIS is pushed to USS`);
 
                 await this.pushUserStatusToUSS(uss, userStatus);
-                await vscode.commands.executeCommand('antigravity.handleAuthRefresh');
 
                 // Continue USS stabilization in background (profile pic, data growth)
-                this.stabilizeUSS(uss, ls, ca, generation, userStatus.length, intervalMs, maxWaitMs - (Date.now() - start))
+                this.stabilizeUSS(uss, server!, generation, userStatus.length, intervalMs, maxWaitMs - (Date.now() - start))
                     .catch(err => log.warn('USS stabilization error:', err?.message));
 
                 return { confirmed: true };
             } catch (e: any) {
                 const msg = e?.message || '';
                 log.info(`FORENSIC poll#${pollCount} ERROR: ${msg}`);
-                // CSRF token regenerated after registerGdmUser — re-discover endpoints
+                // CSRF token regenerated after registerGdmUser — re-resolve server
                 if (msg.includes('401') || msg.includes('CSRF') || msg.includes('unauthenticated')) {
-                    log.info('Poll: CSRF invalid, re-discovering LS endpoints');
-                    lsProcesses = await findLSEndpoints();
-                    if (lsProcesses.length > 0) ls = lsProcesses[0];
+                    log.info('Poll: CSRF invalid, re-resolving server');
+                    server = await this.serverResolver();
+                    if (!server) return { confirmed: false };
                 } else {
                     log.warn('UserStatus poll iteration failed:', msg);
                 }
@@ -407,7 +404,7 @@ export class AccountSwitchService {
      * Detached from the main switch flow.
      */
     private async stabilizeUSS(
-        uss: USSApi, ls: any, ca: Buffer | undefined,
+        uss: USSApi, server: ServerInfo,
         generation: number, initialSize: number,
         intervalMs: number, remainingMs: number,
     ): Promise<void> {
@@ -420,12 +417,12 @@ export class AccountSwitchService {
             await delay(intervalMs);
 
             try {
-                const body = await callLSEndpoint(ls, `${LS_SERVICE_PATH}/GetUserStatus`, ca);
+                const body = await callLsProto(server, `${LS_SERVICE_PATH}/GetUserStatus`);
                 let userStatus = body ? extractField(body, 1) : null;
                 if (!userStatus || userStatus.length <= 5) continue;
 
                 // Append profile picture URL if available
-                const profilePicUrl = await this.fetchProfilePicUrl(ls, ca);
+                const profilePicUrl = await this.fetchProfilePicUrl(server);
                 if (profilePicUrl) {
                     userStatus = Buffer.concat([userStatus, encodeString(38, profilePicUrl)]);
                 }
@@ -437,7 +434,6 @@ export class AccountSwitchService {
                 }
 
                 await this.pushUserStatusToUSS(uss, userStatus);
-                await vscode.commands.executeCommand('antigravity.handleAuthRefresh');
                 log.info(`USS stabilize: grew ${lastSize} → ${userStatus.length}B`);
                 lastSize = userStatus.length;
                 stableCount = 0;
@@ -447,9 +443,9 @@ export class AccountSwitchService {
         }
     }
 
-    private async fetchProfilePicUrl(ls: any, ca: Buffer | undefined): Promise<string> {
+    private async fetchProfilePicUrl(server: ServerInfo): Promise<string> {
         try {
-            const body = await callLSEndpoint(ls, `${LS_SERVICE_PATH}/GetProfileData`, ca);
+            const body = await callLsProto(server, `${LS_SERVICE_PATH}/GetProfileData`);
             const url = body ? extractStringField(body, 1) : '';
             return url.length > 10 ? url : '';
         } catch { /* expected: profile endpoint may not be available */

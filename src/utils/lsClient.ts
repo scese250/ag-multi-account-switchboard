@@ -52,19 +52,24 @@ export async function getWindowsProcessLines(grep: string): Promise<string[]> {
     }
 }
 
-/** { port, csrf, wsId } tuple extracted from a running Language Server process */
+/** { port, csrf, wsId, protocol } tuple extracted from a running Language Server process */
 export interface LsEndpoint {
     port: number;
     csrf: string;
     /** workspace_id from LS process args — used to match the active workspace */
     wsId?: string;
+    /** AG 1.x uses HTTPS (--https_server_port), AG 2.0 uses HTTP (--extension_server_port) */
+    protocol: 'http' | 'https';
 }
 
 // ==================== Process Discovery ====================
 
 /**
- * Find active Language Server processes and extract their HTTPS port + CSRF token
- * directly from process arguments (--https_server_port, --csrf_token).
+ * Find active Language Server processes and extract port + CSRF token
+ * directly from process arguments.
+ *
+ * AG 1.x: --https_server_port + --csrf_token (HTTPS)
+ * AG 2.0: --extension_server_port + --extension_server_csrf_token (HTTP)
  *
  * Cross-platform: ps on macOS/Linux, wmic on Windows.
  * Returns an empty array (never throws) so callers can safely ignore LS absence.
@@ -82,13 +87,26 @@ export async function findLSEndpoints(): Promise<LsEndpoint[]> {
             lines = stdout.trim().split('\n').filter(Boolean);
         }
 
-        return lines.flatMap(line => {
-            const port = line.match(/--https_server_port[=\s]+(\d+)/)?.[1];
-            const csrf = line.match(CSRF_TOKEN_RE)?.[1];
+        return lines.flatMap((line): LsEndpoint[] => {
             const wsId = line.match(/--workspace_id[=\s]+(\S+)/)?.[1];
-            return port && csrf ? [{ port: +port, csrf, wsId }] : [];
+
+            // AG 1.x: --https_server_port + --csrf_token (HTTPS)
+            const httpsPort = line.match(/--https_server_port[=\s]+(\d+)/)?.[1];
+            const csrf = line.match(CSRF_TOKEN_RE)?.[1];
+            if (httpsPort && csrf) {
+                return [{ port: +httpsPort, csrf, wsId, protocol: 'https' as const }];
+            }
+
+            // AG 2.0: --extension_server_port + --extension_server_csrf_token (HTTP)
+            const extPort = line.match(/--extension_server_port[=\s]+(\d+)/)?.[1];
+            const extCsrf = line.match(/--extension_server_csrf_token[=\s]+([\w-]+)/)?.[1];
+            if (extPort && extCsrf) {
+                return [{ port: +extPort, csrf: extCsrf, wsId, protocol: 'http' as const }];
+            }
+
+            return [];
         });
-    } catch { /* expected: JSON parse failure — raw text response */
+    } catch { /* expected: process scan may fail */
         return [];
     }
 }
@@ -120,43 +138,52 @@ export function loadLSCert(): Buffer | undefined {
 
 /**
  * Make a ConnectRPC-style POST to a Language Server endpoint.
+ * Supports both HTTPS (AG 1.x) and HTTP (AG 2.0) based on LsEndpoint.protocol.
  *
- * @param ls       - Endpoint info (port + CSRF token)
+ * @param ls       - Endpoint info (port + CSRF token + protocol)
  * @param endpoint - Full gRPC path, e.g.
  *                   '/exa.language_server_pb.LanguageServerService/RegisterGdmUser'
- * @param ca       - Optional CA cert.  If omitted TLS verification is skipped.
+ * @param ca       - Optional CA cert (HTTPS only). If omitted TLS verification is skipped.
  */
 export function callLSEndpoint(
     ls: LsEndpoint,
     endpoint: string,
     ca?: Buffer,
 ): Promise<Buffer> {
+    const useHttp = ls.protocol === 'http';
+    const mod = useHttp ? http : https;
+
     return new Promise((resolve, reject) => {
-        const req = https.request(
-            {
-                hostname: 'localhost',
-                port: ls.port,
-                path: endpoint,
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/proto',
-                    'Connect-Protocol-Version': '1',
-                    'x-codeium-csrf-token': ls.csrf,
-                    'Content-Length': '0',
-                },
-                ...(ca ? { ca, rejectUnauthorized: true } : { rejectUnauthorized: false }),
+        const opts: http.RequestOptions = {
+            hostname: useHttp ? '127.0.0.1' : 'localhost',
+            port: ls.port,
+            path: endpoint,
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/proto',
+                'Connect-Protocol-Version': '1',
+                'x-codeium-csrf-token': ls.csrf,
+                'Content-Length': '0',
             },
-            async (res) => {
-                try {
-                    const { status, body } = await collectBuffer(res);
-                    if (status === 200) {
-                        resolve(body);
-                    } else {
-                        reject(new Error(`HTTP ${status}: ${body.toString().substring(0, 200)}`));
-                    }
-                } catch (e) { reject(e); }
-            },
-        );
+        };
+
+        // TLS options only for HTTPS
+        if (!useHttp) {
+            Object.assign(opts, ca
+                ? { ca, rejectUnauthorized: true }
+                : { rejectUnauthorized: false });
+        }
+
+        const req = mod.request(opts, async (res) => {
+            try {
+                const { status, body } = await collectBuffer(res);
+                if (status === 200) {
+                    resolve(body);
+                } else {
+                    reject(new Error(`HTTP ${status}: ${body.toString().substring(0, 200)}`));
+                }
+            } catch (e) { reject(e); }
+        });
         req.on('error', reject);
         req.setTimeout(LS_REQUEST_TIMEOUT_MS, () => req.destroy(new Error('LS request timed out')));
         req.end();
